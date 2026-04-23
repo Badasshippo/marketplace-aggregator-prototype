@@ -18,6 +18,7 @@
     "typescript": "^5.6.0"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1035.0",
     "@aws-sdk/client-dynamodb": "^3.716.0",
     "@aws-sdk/client-secrets-manager": "^3.716.0",
     "@aws-sdk/client-sqs": "^3.716.0",

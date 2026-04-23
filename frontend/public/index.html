@@ -3,134 +3,280 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta
-      name="description"
-      content="List once on a unified control plane. Mock eBay-style publish pipeline with signed webhooks and a live activity feed."
-    />
-    <meta name="theme-color" content="#0a0a0b" />
-    <title>OmniList — unified marketplace control</title>
+    <meta name="description" content="OmniList — list once, sell everywhere." />
+    <meta name="theme-color" content="#060608" />
+    <title>OmniList — Seller Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap"
-      rel="stylesheet"
-    />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..900;1,14..32,300..900&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <a class="skip-link" href="#main">Skip to content</a>
+    <a class="skip-link" href="#main">Skip to main content</a>
 
-    <div class="page-bg" aria-hidden="true"></div>
+    <!-- Toast container -->
+    <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
-    <header class="topbar">
+    <!-- Lightbox -->
+    <div id="lightbox" class="lightbox" hidden role="dialog" aria-label="Image preview">
+      <button class="lightbox__close" id="lightbox-close" aria-label="Close">✕</button>
+      <img id="lightbox-img" class="lightbox__img" alt="" />
+    </div>
+
+    <!-- Page background -->
+    <div class="page-bg" aria-hidden="true">
+      <div class="page-bg__orb page-bg__orb--1"></div>
+      <div class="page-bg__orb page-bg__orb--2"></div>
+    </div>
+
+    <!-- Topbar -->
+    <header class="topbar" role="banner">
       <div class="topbar__inner">
         <div class="brand">
-          <span class="brand__mark" aria-hidden="true"></span>
-          <div>
-            <p class="brand__name">OmniList</p>
-            <p class="brand__tag">One listing. Mock marketplace. Real pipeline.</p>
+          <div class="brand__icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M3 9L7.5 13.5L15 4.5" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </div>
+          <span class="brand__name">OmniList</span>
+          <span class="brand__divider" aria-hidden="true"></span>
+          <span class="brand__sub">Seller Dashboard</span>
         </div>
-        <div class="topbar__meta" id="connection-pill" role="status">
-          <span class="pulse" aria-hidden="true"></span>
-          <span id="connection-label">Ready</span>
+        <nav class="topbar__nav" aria-label="Channels">
+          <div class="channel-chip channel-chip--ebay" title="Mock eBay — HMAC webhooks, FIFO SQS, 15% synthetic failures">
+            <span class="channel-chip__dot"></span>
+            <span>mock eBay</span>
+            <span class="channel-chip__badge">active</span>
+          </div>
+        </nav>
+        <div class="topbar__right">
+          <div class="status-pill" id="connection-pill" role="status">
+            <span class="status-dot" id="status-dot"></span>
+            <span id="connection-label">Loading</span>
+          </div>
         </div>
       </div>
     </header>
 
     <main id="main" class="main">
-      <div class="main__grid">
-        <section class="panel panel--form" aria-labelledby="form-heading">
-          <div class="panel__head">
-            <h1 id="form-heading" class="panel__title">New listing</h1>
-            <p class="panel__lede">
-              Title, story, and price flow to a rate-limited async publisher. Webhooks
-              <code>new_comment</code> and <code>item_sold</code> land in your feed.
-            </p>
+
+      <!-- Stats bar -->
+      <div class="stats-bar" aria-label="Dashboard statistics">
+        <div class="stat-card">
+          <span class="stat-card__icon" aria-hidden="true">📦</span>
+          <div class="stat-card__body">
+            <span class="stat-card__value" id="stat-total">—</span>
+            <span class="stat-card__label">Total</span>
           </div>
-          <form id="listing-form" class="form" novalidate>
-            <div class="field">
-              <label for="f-title">Title</label>
-              <input
-                id="f-title"
-                name="title"
-                type="text"
-                required
-                maxlength="200"
-                autocomplete="off"
-                placeholder="Leica M6 TTL · near mint"
-              />
+        </div>
+        <div class="stat-card">
+          <span class="stat-card__icon" aria-hidden="true">⏳</span>
+          <div class="stat-card__body">
+            <span class="stat-card__value" id="stat-publishing">—</span>
+            <span class="stat-card__label">Publishing</span>
+          </div>
+        </div>
+        <div class="stat-card">
+          <span class="stat-card__icon" aria-hidden="true">🟢</span>
+          <div class="stat-card__body">
+            <span class="stat-card__value" id="stat-live">—</span>
+            <span class="stat-card__label">Live</span>
+          </div>
+        </div>
+        <div class="stat-card stat-card--revenue">
+          <span class="stat-card__icon" aria-hidden="true">💰</span>
+          <div class="stat-card__body">
+            <span class="stat-card__value" id="stat-revenue">—</span>
+            <span class="stat-card__label">Revenue</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main grid -->
+      <div class="main__grid">
+
+        <!-- LEFT: Create listing -->
+        <aside class="sidebar" aria-label="Create listing">
+          <div class="panel panel--create">
+            <div class="panel__head">
+              <h1 class="panel__title">
+                <span class="panel__title-icon" aria-hidden="true">＋</span>
+                New listing
+              </h1>
+              <p class="panel__sub">List once, reach every channel.</p>
             </div>
-            <div class="field">
-              <label for="f-desc">Description</label>
-              <textarea
-                id="f-desc"
-                name="description"
-                required
-                rows="5"
-                maxlength="4000"
-                placeholder="Condition, inclusions, shipping policy…"
-              ></textarea>
-            </div>
-            <div class="field-row">
-              <div class="field field--price">
-                <label for="f-price">Price (USD)</label>
-                <input
-                  id="f-price"
-                  name="price"
-                  type="number"
-                  inputmode="decimal"
-                  step="0.01"
-                  min="0"
-                  required
-                  placeholder="0.00"
-                />
-              </div>
-              <div class="field field--image">
-                <label for="f-photo">Image URL <span class="optional">optional</span></label>
-                <input
-                  id="f-photo"
-                  name="photoUrl"
-                  type="url"
-                  inputmode="url"
-                  placeholder="https://…"
-                />
-              </div>
-            </div>
-            <div class="form__actions">
-              <button type="submit" class="btn btn--primary" id="submit-btn">
-                <span class="btn__shimmer" aria-hidden="true"></span>
-                <span>Publish to mock marketplace</span>
+
+            <div class="mode-tabs" role="tablist" aria-label="Listing method">
+              <button class="mode-tab is-active" role="tab" aria-selected="true" data-tab="manual" id="tabctl-manual" aria-controls="tab-manual">
+                <span aria-hidden="true">✏️</span> Manual
               </button>
-              <p id="form-status" class="form__status" role="status" aria-live="polite"></p>
+              <button class="mode-tab" role="tab" aria-selected="false" data-tab="ai" id="tabctl-ai" aria-controls="tab-ai">
+                <span aria-hidden="true">✨</span> AI · 1 item
+              </button>
+              <button class="mode-tab" role="tab" aria-selected="false" data-tab="bulk" id="tabctl-bulk" aria-controls="tab-bulk">
+                <span aria-hidden="true">🗂️</span> AI · Bulk
+              </button>
             </div>
-          </form>
+
+            <!-- Manual tab -->
+            <div id="tab-manual" class="tab-panel" role="tabpanel" aria-labelledby="tabctl-manual">
+              <form id="listing-form" class="form" novalidate autocomplete="off">
+                <div class="field">
+                  <div class="field__header">
+                    <label for="f-title">Title</label>
+                    <span class="char-count" id="title-count">0 / 200</span>
+                  </div>
+                  <input id="f-title" name="title" type="text" required maxlength="200" placeholder="Sony A7III · full kit, near mint" />
+                </div>
+                <div class="field">
+                  <div class="field__header">
+                    <label for="f-desc">Description</label>
+                    <span class="char-count" id="desc-count">0 / 4000</span>
+                  </div>
+                  <textarea id="f-desc" name="description" required rows="4" maxlength="4000" placeholder="Condition, accessories, shipping…"></textarea>
+                </div>
+                <div class="field-row">
+                  <div class="field">
+                    <label for="f-price">Price (USD)</label>
+                    <div class="input-prefix-wrap">
+                      <span class="input-prefix" aria-hidden="true">$</span>
+                      <input id="f-price" name="price" type="number" inputmode="decimal" step="0.01" min="0" required placeholder="0.00" />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="f-photo">Image URL <span class="field__optional">optional</span></label>
+                    <input id="f-photo" name="photoUrl" type="url" inputmode="url" placeholder="https://…" />
+                  </div>
+                </div>
+                <div class="publish-target">
+                  <span class="publish-target__icon" aria-hidden="true">🏪</span>
+                  <div class="publish-target__info">
+                    <span class="publish-target__name">mock eBay</span>
+                    <span class="publish-target__desc">Async · signed webhooks · HMAC-verified</span>
+                  </div>
+                  <span class="publish-target__status">Ready</span>
+                </div>
+                <button type="submit" class="btn btn--publish" id="submit-btn">
+                  <span class="btn__shimmer" aria-hidden="true"></span>
+                  <span aria-hidden="true">🚀</span>
+                  <span id="submit-label">Publish listing</span>
+                </button>
+              </form>
+            </div>
+
+            <!-- AI single tab -->
+            <div id="tab-ai" class="tab-panel" role="tabpanel" aria-labelledby="tabctl-ai" hidden>
+              <p class="ai-intro">Snap or upload a photo — Claude identifies the item and fills in title, description, and price. You review before anything publishes.</p>
+              <div class="photo-zone" id="photo-drop">
+                <input type="file" id="photo-input" accept="image/jpeg,image/png,image/webp,image/avif,image/heic,image/heif" capture="environment" hidden />
+                <div id="photo-placeholder" class="photo-zone__placeholder">
+                  <div class="photo-zone__icon-wrap" aria-hidden="true">
+                    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                  </div>
+                  <p class="photo-zone__label">Drop photo here or</p>
+                  <button type="button" class="btn btn--ghost btn--sm" id="photo-pick-btn">Browse files</button>
+                  <p class="photo-zone__hint">JPEG · PNG · WebP · AVIF · HEIC — max ~4 MB</p>
+                </div>
+                <img id="photo-preview" class="photo-zone__preview" hidden alt="Product photo preview" />
+              </div>
+              <div class="ai-actions">
+                <button type="button" class="btn btn--ghost btn--sm" id="photo-change-btn" hidden>Change photo</button>
+                <button type="button" class="btn btn--ai" id="analyze-btn" disabled>
+                  <span class="btn__shimmer" aria-hidden="true"></span>
+                  <span aria-hidden="true">✨</span>
+                  <span id="analyze-label">Analyze with AI</span>
+                </button>
+              </div>
+              <p id="analyze-status" class="ai-status" aria-live="polite"></p>
+            </div>
+
+            <!-- AI bulk tab -->
+            <div id="tab-bulk" class="tab-panel" role="tabpanel" aria-labelledby="tabctl-bulk" hidden>
+              <p class="ai-intro">Take one photo of <strong>multiple items</strong> — Claude identifies each one separately and creates a draft for all of them. You pick which ones to publish.</p>
+              <div class="photo-zone" id="bulk-photo-drop">
+                <input type="file" id="bulk-photo-input" accept="image/jpeg,image/png,image/webp,image/avif,image/heic,image/heif" capture="environment" hidden />
+                <div id="bulk-photo-placeholder" class="photo-zone__placeholder">
+                  <div class="photo-zone__icon-wrap" aria-hidden="true">
+                    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><path d="M7 8l3 3 2-2 3 3"/></svg>
+                  </div>
+                  <p class="photo-zone__label">Photo with multiple items</p>
+                  <button type="button" class="btn btn--ghost btn--sm" id="bulk-photo-pick-btn">Browse files</button>
+                  <p class="photo-zone__hint">Works best with 2–10 distinct items visible</p>
+                </div>
+                <img id="bulk-photo-preview" class="photo-zone__preview" hidden alt="Bulk photo preview" />
+              </div>
+              <div class="ai-actions">
+                <button type="button" class="btn btn--ghost btn--sm" id="bulk-photo-change-btn" hidden>Change photo</button>
+                <button type="button" class="btn btn--ai" id="bulk-analyze-btn" disabled>
+                  <span class="btn__shimmer" aria-hidden="true"></span>
+                  <span aria-hidden="true">🗂️</span>
+                  <span id="bulk-analyze-label">Identify all items</span>
+                </button>
+              </div>
+              <p id="bulk-analyze-status" class="ai-status" aria-live="polite"></p>
+
+              <!-- Bulk results -->
+              <div id="bulk-results" class="bulk-results" hidden>
+                <div class="bulk-results__header">
+                  <div>
+                    <p class="bulk-results__title">Found <strong id="bulk-count">0</strong> items</p>
+                    <p class="bulk-results__sub">Edit as needed · uncheck any you don't want</p>
+                  </div>
+                  <div class="bulk-results__actions">
+                    <button type="button" class="btn btn--ghost btn--sm" id="bulk-select-all-btn">Select all</button>
+                    <button type="button" class="btn btn--publish btn--sm" id="bulk-publish-btn" disabled>
+                      <span class="btn__shimmer" aria-hidden="true"></span>
+                      <span id="bulk-publish-label">Publish selected</span>
+                    </button>
+                  </div>
+                </div>
+                <div id="bulk-items-list" class="bulk-items"></div>
+              </div>
+            </div>
+
+          </div>
+        </aside>
+
+        <!-- RIGHT: Feed -->
+        <section class="feed-section" aria-labelledby="feed-heading">
+          <div class="feed-header">
+            <div>
+              <h2 id="feed-heading" class="feed-title">Active Listings</h2>
+              <p class="feed-sub" id="feed-sub">Loading…</p>
+            </div>
+            <div class="feed-controls">
+              <!-- Selection toolbar (hidden until checkboxes used) -->
+              <div id="selection-toolbar" class="selection-toolbar" hidden>
+                <span id="selection-count" class="selection-count">0 selected</span>
+                <button type="button" class="btn btn--err btn--sm" id="delete-selected-btn">🗑 Delete selected</button>
+                <button type="button" class="btn btn--ghost btn--sm" id="cancel-selection-btn">Cancel</button>
+              </div>
+              <div id="normal-controls" class="normal-controls">
+                <label class="live-toggle" title="Auto-refresh every 2s">
+                  <input type="checkbox" id="auto-refresh" checked />
+                  <span class="live-toggle__track" aria-hidden="true"><span class="live-toggle__thumb"></span></span>
+                  <span class="live-toggle__label">Live</span>
+                </label>
+                <button type="button" class="btn btn--ghost btn--sm" id="select-mode-btn" title="Select listings to delete">☑ Select</button>
+                <button type="button" class="btn btn--ghost btn--sm" id="refresh-btn">↺ Refresh</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="listings-root" class="listings-grid" aria-live="polite" aria-busy="true">
+            <div class="skeleton-card"></div>
+            <div class="skeleton-card"></div>
+            <div class="skeleton-card"></div>
+          </div>
+
+          <div class="dlq-panel" id="dlq-panel">
+            <div class="dlq-panel__icon" aria-hidden="true">⚠️</div>
+            <div class="dlq-panel__body">
+              <p class="dlq-panel__title">Dead-letter queue</p>
+              <p class="dlq-panel__desc">Failed publish jobs after 6 SQS retries (~15% synthetic). Replay re-enqueues them.</p>
+            </div>
+            <button type="button" class="btn btn--warn btn--sm" id="replay-dlq-btn">Replay DLQ</button>
+          </div>
         </section>
 
-        <section class="panel panel--feed" aria-labelledby="feed-heading">
-          <div class="panel__head panel__head--row">
-            <div>
-              <h2 id="feed-heading" class="panel__title">Listings &amp; activity</h2>
-              <p class="panel__lede panel__lede--tight">
-                Live when anything is still moving through the pipeline. Idle when everything is
-                sold or failed.
-              </p>
-            </div>
-            <div class="feed-tools">
-              <label class="toggle" title="Refresh every 2s while listings are in flight">
-                <input type="checkbox" id="auto-refresh" checked />
-                <span>Live updates</span>
-              </label>
-              <button type="button" class="btn btn--ghost" id="refresh-btn">Refresh now</button>
-            </div>
-          </div>
-          <div id="listings-root" class="listings" aria-live="polite" aria-busy="false">
-            <div class="skeleton-grid" id="skeleton">
-              <div class="skeleton-card"></div>
-              <div class="skeleton-card"></div>
-            </div>
-          </div>
-        </section>
       </div>
     </main>
 

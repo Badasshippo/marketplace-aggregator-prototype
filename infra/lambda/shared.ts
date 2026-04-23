@@ -22,9 +22,9 @@ export function jsonResponse(
 export function corsHeaders(): Record<string, string> {
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     "access-control-allow-headers":
-      "content-type,idempotency-key,x-marketplace-signature,x-marketplace-timestamp",
+      "content-type,idempotency-key,x-marketplace-signature,x-marketplace-timestamp,authorization",
   };
 }
 

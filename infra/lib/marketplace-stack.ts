@@ -1,7 +1,9 @@
 import * as cdk from "aws-cdk-lib";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2int from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -31,6 +33,7 @@ export class MarketplaceStack extends cdk.Stack {
         passwordLength: 48,
       },
     });
+
 
     const listingsTable = new dynamodb.Table(this, "Listings", {
       partitionKey: { name: "listingId", type: dynamodb.AttributeType.STRING },
@@ -79,7 +82,8 @@ export class MarketplaceStack extends cdk.Stack {
       authType: lambda.FunctionUrlAuthType.NONE,
       cors: {
         allowedOrigins: ["*"],
-        allowedMethods: [lambda.HttpMethod.POST, lambda.HttpMethod.OPTIONS],
+        // * (ALL) — CloudFormation rejects OPTIONS in AllowMethods; API Lambda calls mock (no browser CORS to mock).
+        allowedMethods: [lambda.HttpMethod.ALL],
         allowedHeaders: ["content-type"],
       },
     });
@@ -96,12 +100,25 @@ export class MarketplaceStack extends cdk.Stack {
         IDEMPOTENCY_INDEX_NAME: "idempotency-key-index",
         MOCK_PUBLISH_URL: mockAcceptUrl.url,
         WEBHOOK_SECRET_ARN: webhookSecret.secretArn,
+        MOCK_DLQ_URL: mockDlq.queueUrl,
+        MOCK_QUEUE_URL: mockQueue.queueUrl,
       },
       logRetention: logs.RetentionDays.THREE_DAYS,
     });
     listingsTable.grantReadWriteData(apiFn);
     activityTable.grantReadWriteData(apiFn);
     webhookSecret.grantRead(apiFn);
+    mockDlq.grantConsumeMessages(apiFn);
+    mockQueue.grantSendMessages(apiFn);
+    apiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel"],
+        resources: [
+          `arn:aws:bedrock:*::foundation-model/anthropic.*`,
+          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+        ],
+      })
+    );
 
     const httpApi = new apigwv2.HttpApi(this, "HttpApi", {
       apiName: "marketplace-aggregator-api",
@@ -111,10 +128,12 @@ export class MarketplaceStack extends cdk.Stack {
           "idempotency-key",
           "x-marketplace-signature",
           "x-marketplace-timestamp",
+          "authorization",
         ],
         allowMethods: [
           apigwv2.CorsHttpMethod.GET,
           apigwv2.CorsHttpMethod.POST,
+          apigwv2.CorsHttpMethod.DELETE,
           apigwv2.CorsHttpMethod.OPTIONS,
         ],
         allowOrigins: ["*"],
@@ -135,6 +154,26 @@ export class MarketplaceStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.POST],
       integration: apiIntegration,
     });
+    httpApi.addRoutes({
+      path: "/listings/analyze",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/admin/replay-dlq",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/listings/{listingId}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: apiIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/listings/batch-delete",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+    });
 
     const mockWorkerFn = new lambdaNode.NodejsFunction(this, "MockWorkerFn", {
       runtime: lambda.Runtime.NODEJS_20_X,
@@ -142,7 +181,8 @@ export class MarketplaceStack extends cdk.Stack {
       handler: "handler",
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
-      reservedConcurrentExecutions: 5,
+      // No reserved concurrency: new accounts often have low regional limits; reserving
+      // capacity can push unreserved below the account minimum. Throttle via SQS maxConcurrency instead.
       environment: {
         WEBHOOK_URL: `${httpApi.apiEndpoint}/webhooks/marketplace`,
         WEBHOOK_SECRET_ARN: webhookSecret.secretArn,
@@ -151,7 +191,10 @@ export class MarketplaceStack extends cdk.Stack {
     });
     webhookSecret.grantRead(mockWorkerFn);
     mockWorkerFn.addEventSource(
-      new lambdaEventSources.SqsEventSource(mockQueue, { batchSize: 1 })
+      new lambdaEventSources.SqsEventSource(mockQueue, {
+        batchSize: 1,
+        maxConcurrency: 5,
+      })
     );
     mockQueue.grantConsumeMessages(mockWorkerFn);
 
@@ -242,6 +285,39 @@ export class MarketplaceStack extends cdk.Stack {
       destinationBucket: siteBucket,
       distribution,
       distributionPaths: ["/*"],
+    });
+
+    new cloudwatch.Alarm(this, "ApiErrorAlarm", {
+      alarmName: "marketplace-api-lambda-errors",
+      alarmDescription: "API Lambda errors > 5 in 5 min",
+      metric: apiFn.metricErrors({ period: cdk.Duration.minutes(5), statistic: "Sum" }),
+      threshold: 5,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+    });
+
+    new cloudwatch.Alarm(this, "DlqDepthAlarm", {
+      alarmName: "marketplace-dlq-depth",
+      alarmDescription: "Messages visible in mock publish DLQ (failed jobs)",
+      metric: mockDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+        statistic: "Maximum",
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+    });
+
+    new cloudwatch.Alarm(this, "MockWorkerErrorAlarm", {
+      alarmName: "marketplace-mock-worker-errors",
+      alarmDescription: "Mock worker Lambda errors > 10 in 5 min (synthetic ~15% expected)",
+      metric: mockWorkerFn.metricErrors({ period: cdk.Duration.minutes(5), statistic: "Sum" }),
+      threshold: 10,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
     });
 
     new cdk.CfnOutput(this, "CloudFrontURL", {

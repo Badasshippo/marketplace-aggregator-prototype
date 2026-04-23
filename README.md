@@ -29,7 +29,19 @@ After deploy, note:
 - **CloudFrontURL** — open in a browser (UI calls `/api/...` on the same host).
 - **HttpApiUrl** — direct API Gateway base URL (for `curl` / smoke tests).
 - **MockPublishFunctionUrl** — mock marketplace ingress (also invoked by the API Lambda).
-- **WebhookSecretArn** — generated secret (never committed); Lambdas read it at runtime.
+- **WebhookSecretArn** — generated HMAC secret (never committed); Lambdas read it at runtime.
+- **AuthTokenArn** — Secrets Manager ARN for the shared frontend API token.
+- **GetAuthTokenCommand** — paste this command in your terminal to retrieve the token.
+
+### First login
+
+The UI requires an API key on first load. Get it by running the **GetAuthTokenCommand** value from the stack outputs:
+
+```bash
+aws secretsmanager get-secret-value --secret-id <AuthTokenArn> --query SecretString --output text --region us-west-2
+```
+
+Paste the token into the login screen. It is saved in `localStorage` for subsequent visits.
 
 ## Tear down
 
@@ -47,7 +59,18 @@ Not supported end-to-end (the app is intentionally serverless). For local experi
 
 Normal flow: create a listing in the UI. The API Lambda `POST`s to the mock ingress; the mock enqueues FIFO SQS work; the worker applies ~**15%** synthetic failures (SQS retries), then posts **two signed webhooks** (`new_comment` then `item_sold`).
 
-**Dead letters**: after **6** failed receives, messages land in the FIFO DLQ (`MockPublishDLQ`) for inspection.
+**Dead letters**: after **6** failed receives, messages land in the FIFO DLQ (`MockPublishDLQ`). Use the **Replay DLQ** button in the UI (or `POST /api/admin/replay-dlq`) to re-enqueue them.
+
+## AI photo → listing (✨ AI from photo tab)
+
+1. Enable **Claude 3 Haiku** model access in the AWS console:  
+   **Amazon Bedrock → Model access → Anthropic: Claude 3 Haiku → Request access** (us-west-2).  
+   This is a one-time, usually-instant approval in your account.
+2. In the UI, click **✨ AI from photo**, upload or take a photo of the item you want to sell.
+3. Click **Analyze with AI** — Claude identifies the item and suggests a title, description, and price.
+4. The form is pre-filled; edit anything you want, then click **Publish to mock marketplace**.
+
+The Lambda endpoint is `POST /api/listings/analyze` (requires `Authorization: Bearer <token>`, accepts `{ imageBase64, mediaType }`). If Bedrock model access is not enabled, the API returns a `503` with instructions.
 
 ## Smoke test (deployed API)
 
@@ -66,14 +89,17 @@ No AWS keys or marketplace tokens belong in git. The webhook HMAC secret is **cr
 
 Prototype-scale traffic is usually **well under a few dollars** for 24h: Lambda, HTTP API, DynamoDB on-demand, SQS, CloudFront data transfer, Secrets Manager (~$0.02/day of the monthly secret charge prorated), and S3. **NAT Gateway / idle ECS / provisioned RDS** are deliberately avoided. Re-check the [AWS pricing calculator](https://calculator.aws/) for your region.
 
-## Observability (first alarms)
+## Observability
 
-If this were production-adjacent, the first CloudWatch alarms would be:
+Three **CloudWatch alarms** are deployed with the stack (visible in the CloudWatch console):
 
-1. **API Lambda errors + duration p95** (throttles / cold starts).  
-2. **Mock worker errors** and **DLQ depth > 0**.  
-3. **HTTP API 5xx** count.  
-4. **DynamoDB** `UserErrors` / throttling (signals hot keys).
+| Alarm | Condition |
+|-------|-----------|
+| `marketplace-api-lambda-errors` | API Lambda errors ≥ 5 in a 5-min window |
+| `marketplace-dlq-depth` | DLQ visible messages ≥ 1 |
+| `marketplace-mock-worker-errors` | Worker errors ≥ 10 in 5 min (synthetic ~15% expected) |
+
+To receive email notifications, add an **SNS topic + email subscription** to each alarm in the CloudWatch console, or wire it in CDK before deploy.
 
 ## Assumptions / judgement calls
 
