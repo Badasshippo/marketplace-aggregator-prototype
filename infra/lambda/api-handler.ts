@@ -26,6 +26,8 @@ import {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } from "@aws-sdk/client-bedrock-runtime";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import {
   corsHeaders,
@@ -41,6 +43,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 const sm = new SecretsManagerClient({});
 const sqs = new SQSClient({});
 const bedrock = new BedrockRuntimeClient({});
+const s3client = new S3Client({});
 
 const LISTINGS_TABLE = process.env.LISTINGS_TABLE!;
 const ACTIVITY_TABLE = process.env.ACTIVITY_TABLE!;
@@ -49,6 +52,8 @@ const MOCK_PUBLISH_URL = process.env.MOCK_PUBLISH_URL!;
 const WEBHOOK_SECRET_ARN = process.env.WEBHOOK_SECRET_ARN!;
 const MOCK_DLQ_URL = process.env.MOCK_DLQ_URL!;
 const MOCK_QUEUE_URL = process.env.MOCK_QUEUE_URL!;
+const PHOTOS_BUCKET = process.env.PHOTOS_BUCKET!;
+const PHOTOS_BASE_URL = process.env.PHOTOS_BASE_URL!;
 
 let cachedWebhookSecret: string | undefined;
 
@@ -100,6 +105,7 @@ export async function handler(
     if (path === "/listings" && method === "GET") return await listListings();
     if (path === "/listings" && method === "POST") return await createListing(event);
     if (path === "/listings/analyze" && method === "POST") return await analyzeListing(event);
+    if (path === "/listings/photo-upload-url" && method === "POST") return await getPhotoUploadUrl(event);
     if (path === "/listings/batch-delete" && method === "POST") return await batchDeleteListings(event);
     if (path === "/admin/replay-dlq" && method === "POST") return await replayDlq();
     if (path === "/webhooks/marketplace" && method === "POST") return await ingestWebhook(event);
@@ -335,24 +341,30 @@ async function analyzeListing(
   }
 
   const prompt = bulk
-    ? `You are a marketplace listing assistant helping sell items online. Look at this image carefully.
+    ? `You are an expert marketplace listing assistant with deep knowledge of resale prices. Look at this image carefully.
 
-TASK: Identify every distinct physical item visible (products, cards, electronics, clothing, collectibles, sports cards, toys, books — anything someone would buy).
+TASK: Identify EVERY distinct physical item visible. Treat each card, object, or product as its own separate entry — even if multiple are the same type.
 
-OUTPUT FORMAT: Respond with ONLY a raw JSON array. No explanation, no markdown, no code fences. Start your response with [ and end with ].
+OUTPUT FORMAT: ONLY a raw JSON array. Start with [ and end with ]. No markdown, no explanation.
 
 Each element must have exactly these keys:
-- "title": string, max 80 chars, be specific (include brand, model, player name, year if visible)
-- "description": string, 2-3 sentences about condition, visible details, and what a buyer should know
-- "suggestedPriceCents": integer, realistic USD resale price in cents (e.g. 999 = $9.99)
+- "title": string, max 80 chars — be specific: brand, model, player name, year, card set/number, specs
+- "condition": one of exactly "New" | "Like New" | "Good" | "Fair" | "Poor"
+- "description": string, 2 sentences — what it is and its specific visible condition/details
+- "suggestedPriceCents": integer — realistic USD resale cents based on condition and item rarity
 
-Example output: [{"title":"1992 Michael Jordan Upper Deck Card #23","description":"Basketball trading card in good condition. Light wear on edges, face shows clearly. Great addition to any Bulls collection.","suggestedPriceCents":2499}]
+Example: [{"title":"1986 Fleer Michael Jordan #57 Basketball Card","condition":"Good","description":"Jordan rookie-era card showing Bulls uniform clearly. Light corner wear, no creases.","suggestedPriceCents":24900}]
 
-Return up to 10 items. Each card, item, or object in the photo is its own entry.`
-    : "You are a marketplace listing assistant. Analyze this product image and return ONLY a valid JSON object with these exact fields (no markdown fences, no extra text):\n" +
-      '- "title": string (max 80 chars, specific product name with brand/model if visible)\n' +
-      '- "description": string (2-3 sentences covering condition, key features, and any visible details)\n' +
-      '- "suggestedPriceCents": integer (realistic USD resale price in cents, e.g. 4999 for $49.99)';
+Return up to 10 items. For sports cards: include player, year, set name, and card number if visible.`
+    : `You are an expert marketplace listing assistant with deep knowledge of resale prices. Analyze this product image and return ONLY a valid JSON object (no markdown, no text outside the braces):
+
+Fields:
+- "title": string, max 80 chars — include brand, model, year, key specs, or player/subject name if visible
+- "condition": one of exactly: "New" | "Like New" | "Good" | "Fair" | "Poor" — assess from visible wear, scratches, yellowing, creases, packaging
+- "description": string, 2-3 sentences — lead with what the item is, then note specific condition details visible in the image, then mention what a buyer should know (completeness, storage, provenance if obvious)
+- "suggestedPriceCents": integer — realistic USD resale price in cents. Factor in condition: New=retail or above, Like New=80-95% of retail, Good=50-70%, Fair=25-45%, Poor=10-25%. For collectibles/cards factor in rarity and era.
+
+Example: {"title":"1986 Fleer Michael Jordan Rookie Card #57","condition":"Good","description":"Classic Michael Jordan Fleer rookie card showing Jordan in his iconic Bulls uniform. Card shows moderate wear with light corner touches and centering slightly off. No creases or major defects visible.","suggestedPriceCents":29900}`;
 
   try {
     const raw = await bedrock.send(
@@ -413,9 +425,11 @@ Return up to 10 items. Each card, item, or object in the photo is its own entry.
         });
       }
 
+      const validConds = ["New", "Like New", "Good", "Fair", "Poor"];
       return jsonResponse(200, {
         items: arr.slice(0, 10).map((s) => ({
           title: String(s.title ?? "").trim().slice(0, 200),
+          condition: validConds.includes(s.condition as string) ? s.condition : null,
           description: String(s.description ?? "").trim().slice(0, 4000),
           suggestedPriceCents: Math.max(0, Math.round(Number(s.suggestedPriceCents) || 0)),
         })),
@@ -427,9 +441,12 @@ Return up to 10 items. Each card, item, or object in the photo is its own entry.
       return jsonResponse(502, { error: "ai_parse_error", detail: "AI returned no JSON block." });
     }
     const s = JSON.parse(match[0]);
+    const validConditions = ["New", "Like New", "Good", "Fair", "Poor"];
+    const condition = validConditions.includes(s.condition) ? s.condition : null;
     return jsonResponse(200, {
       suggestion: {
         title: String(s.title ?? "").trim().slice(0, 200),
+        condition,
         description: String(s.description ?? "").trim().slice(0, 4000),
         suggestedPriceCents: Math.max(0, Math.round(Number(s.suggestedPriceCents) || 0)),
       },
@@ -495,6 +512,33 @@ async function batchDeleteListings(
 
   await Promise.all(ids.map((id) => deleteListingData(id)));
   return jsonResponse(200, { deleted: ids.length });
+}
+
+async function getPhotoUploadUrl(
+  event: APIGatewayProxyEventV2
+): Promise<APIGatewayProxyResultV2> {
+  let body: { mediaType?: string };
+  try {
+    body = JSON.parse(event.body ?? "{}");
+  } catch {
+    return jsonResponse(400, { error: "invalid_json" });
+  }
+  const mediaType = body.mediaType ?? "image/jpeg";
+  const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+  if (!allowedTypes.includes(mediaType)) {
+    return jsonResponse(400, { error: "unsupported_media_type" });
+  }
+  const ext = mediaType === "image/png" ? "png" : mediaType === "image/webp" ? "webp" : "jpg";
+  const key = `photos/${randomUUID()}.${ext}`;
+  const uploadUrl = await getSignedUrl(
+    s3client,
+    new PutObjectCommand({ Bucket: PHOTOS_BUCKET, Key: key, ContentType: mediaType }),
+    { expiresIn: 300 }
+  );
+  return jsonResponse(200, {
+    uploadUrl,
+    photoUrl: `${PHOTOS_BASE_URL}/${key}`,
+  });
 }
 
 async function replayDlq(): Promise<APIGatewayProxyResultV2> {

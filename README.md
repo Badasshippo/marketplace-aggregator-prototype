@@ -1,47 +1,60 @@
-# Marketplace aggregator prototype
+# OmniList — Marketplace Aggregator Prototype
 
-Senior engineer assignment (**Variant 2 — approach + prototype**): unified listing creation, mocked third-party marketplace (async, flaky, rate-limited), signed webhooks (`new_comment`, `item_sold`), DynamoDB persistence, static UI behind CloudFront. The UI includes optional product image (HTTPS URL), live polling until listings settle, and security headers on the static origin.
+**Variant 2 · Senior Engineer Assignment** — a working marketplace aggregator deployed on AWS. List a product once, push it to a mocked eBay-style pipeline, and watch every webhook event flow back into a unified activity feed.
 
-See [APPROACH.md](./APPROACH.md) for architecture, eBay reference notes, safety, and cost.
+**Live URL:** `https://d2vr1psucpbtp2.cloudfront.net` *(deployed, publicly accessible)*
+
+See [APPROACH.md](./APPROACH.md) for architecture decisions, eBay reference notes, safety model, and cost analysis.
+
+---
+
+## What it does
+
+- **Create a listing** (title, description, price, optional image URL) or **snap a photo** and let Claude Haiku 4.5 fill the form via Amazon Bedrock
+- **Bulk AI listing** — one photo of multiple items → Claude identifies each one → review and publish all in one click
+- The listing is dispatched to a **mock eBay marketplace** (separate Lambda + FIFO SQS), which applies a ~15% synthetic failure rate to prove retries and idempotency work
+- The mock posts two **signed webhooks** back: `new_comment` then `item_sold`
+- A **webhook receiver** validates the HMAC-SHA256 signature and writes events to the aggregated activity feed
+- A **live dashboard** shows all listings, their pipeline state (Submit → Live → Sold), activity timeline, and revenue stats
+
+---
 
 ## Prerequisites
 
-- Node.js **20+**
-- AWS CLI v2 configured (`aws sts get-caller-identity` works)
-- CDK bootstrap once per account/region:
+| Tool | Version | Check |
+|------|---------|-------|
+| Node.js | 20+ | `node -v` |
+| AWS CLI v2 | latest | `aws --version` |
+| AWS credentials configured | — | `aws sts get-caller-identity` |
 
-  ```bash
-  npx aws-cdk@2 bootstrap aws://ACCOUNT_ID/REGION
-  ```
+**One-time CDK bootstrap** (per account + region):
 
-## One-command deploy (from a clean clone)
+```bash
+npx aws-cdk@2 bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/us-west-2
+```
+
+---
+
+## Deploy (single command from a clean clone)
 
 ```bash
 npm install --prefix infra && npm install --prefix frontend && npm run deploy
 ```
 
-This builds the static site into `frontend/dist`, compiles the CDK app, runs `cdk deploy --all --require-approval never` from `infra/`, uploads assets, and invalidates CloudFront.
+This builds the static site, compiles the CDK app, deploys all infrastructure, uploads to S3, and invalidates CloudFront. First deploy takes ~5–10 minutes (CloudFront distribution creation). Subsequent code-only updates take ~30–60 seconds.
 
-### Outputs
+### Stack outputs
 
-After deploy, note:
+After deploy, the terminal prints:
 
-- **CloudFrontURL** — open in a browser (UI calls `/api/...` on the same host).
-- **HttpApiUrl** — direct API Gateway base URL (for `curl` / smoke tests).
-- **MockPublishFunctionUrl** — mock marketplace ingress (also invoked by the API Lambda).
-- **WebhookSecretArn** — generated HMAC secret (never committed); Lambdas read it at runtime.
-- **AuthTokenArn** — Secrets Manager ARN for the shared frontend API token.
-- **GetAuthTokenCommand** — paste this command in your terminal to retrieve the token.
+| Output | Description |
+|--------|-------------|
+| `CloudFrontURL` | Open this in any browser — the full app lives here |
+| `HttpApiUrl` | Direct API Gateway URL for curl / smoke tests |
+| `MockPublishFunctionUrl` | Mock marketplace ingress (called by the API Lambda) |
+| `WebhookSecretArn` | Secrets Manager ARN for the HMAC signing key (never in git) |
 
-### First login
-
-The UI requires an API key on first load. Get it by running the **GetAuthTokenCommand** value from the stack outputs:
-
-```bash
-aws secretsmanager get-secret-value --secret-id <AuthTokenArn> --query SecretString --output text --region us-west-2
-```
-
-Paste the token into the login screen. It is saved in `localStorage` for subsequent visits.
+---
 
 ## Tear down
 
@@ -49,66 +62,136 @@ Paste the token into the login screen. It is saved in `localStorage` for subsequ
 npm run destroy
 ```
 
-(`cdk destroy --all --force` from `infra/`.) Empty the versioned bucket if `cdk destroy` warns about retained objects—this stack uses `autoDeleteObjects` on the site bucket to keep teardown simple.
+Runs `cdk destroy --all --force`. The S3 bucket uses `autoDeleteObjects: true` so no manual cleanup is needed. A single teardown leaves nothing running that will incur charges next month.
 
-## Local usage (no AWS)
-
-Not supported end-to-end (the app is intentionally serverless). For local experiments, run `npm run build` and inspect `infra/cdk.out` after `cd infra && npx cdk synth`.
+---
 
 ## Triggering mock events
 
-Normal flow: create a listing in the UI. The API Lambda `POST`s to the mock ingress; the mock enqueues FIFO SQS work; the worker applies ~**15%** synthetic failures (SQS retries), then posts **two signed webhooks** (`new_comment` then `item_sold`).
+The normal flow is fully automatic:
 
-**Dead letters**: after **6** failed receives, messages land in the FIFO DLQ (`MockPublishDLQ`). Use the **Replay DLQ** button in the UI (or `POST /api/admin/replay-dlq`) to re-enqueue them.
+1. Create a listing in the UI
+2. The API Lambda calls the mock accept endpoint → enqueued in FIFO SQS
+3. The mock worker dequeues, waits 1.5–4s (simulating async partner latency), applies ~15% synthetic failure (SQS retries up to 6 times), then POSTs two signed webhooks:
+   - `new_comment` — simulates a buyer asking "Is this still available?"
+   - `item_sold` — marks the listing sold and closes the pipeline
 
-## AI photo → listing (✨ AI from photo tab)
-
-1. Enable **Claude 3 Haiku** model access in the AWS console:  
-   **Amazon Bedrock → Model access → Anthropic: Claude 3 Haiku → Request access** (us-west-2).  
-   This is a one-time, usually-instant approval in your account.
-2. In the UI, click **✨ AI from photo**, upload or take a photo of the item you want to sell.
-3. Click **Analyze with AI** — Claude identifies the item and suggests a title, description, and price.
-4. The form is pre-filled; edit anything you want, then click **Publish to mock marketplace**.
-
-The Lambda endpoint is `POST /api/listings/analyze` (requires `Authorization: Bearer <token>`, accepts `{ imageBase64, mediaType }`). If Bedrock model access is not enabled, the API returns a `503` with instructions.
-
-## Smoke test (deployed API)
+**If a message fails all 6 retries** it lands in the DLQ. The UI shows a **Replay DLQ** button that re-enqueues failed messages — or call it directly:
 
 ```bash
-export API_URL="https://YOUR_API_ID.execute-api.REGION.amazonaws.com"
+curl -X POST https://YOUR_CLOUDFRONT_URL/api/admin/replay-dlq
+```
+
+---
+
+## AI listing features
+
+### Single item
+
+1. Click the **✨ AI · 1 item** tab
+2. Upload or take a photo (JPEG, PNG, WebP, AVIF, HEIC supported)
+3. Click **Analyze with AI** — Claude Haiku 4.5 returns title, description, and a suggested price
+4. Edit anything, then click **Publish listing**
+
+### Bulk listing (multiple items from one photo)
+
+1. Click the **🗂️ AI · Bulk** tab
+2. Upload a photo containing multiple distinct items (works great for collections, card lots, shelf photos)
+3. Click **Identify all items** — Claude identifies up to 10 separate items
+4. Each item gets an editable card (title, price, description) with a checkbox
+5. Uncheck any you don't want, edit as needed, then **Publish X listings**
+
+**First-time Bedrock setup** (one-time per AWS account):
+Go to [Amazon Bedrock → Model catalog](https://console.aws.amazon.com/bedrock/home#/model-catalog), find **Claude Haiku 4.5**, click **Open in playground** and accept Anthropic's terms. No separate Anthropic account needed — billing goes through AWS.
+
+---
+
+## Delete listings
+
+- **Single delete**: hover a listing card → click the 🗑 button → confirm
+- **Mass delete**: click **☑ Select** in the feed header → check multiple cards → **Delete selected** → confirm
+
+---
+
+## Smoke test (against deployed stack)
+
+```bash
+export API_URL="https://YOUR_API_ID.execute-api.us-west-2.amazonaws.com"
 node scripts/smoke-test.mjs
 ```
 
-Uses `POST /listings` and polls `GET /listings` until activity shows both events and status `sold`.
+Creates a listing, polls `GET /listings` until both `new_comment` and `item_sold` webhooks arrive and status is `sold`. Exits 0 on success, 1 on timeout.
 
-## Secrets
+---
 
-No AWS keys or marketplace tokens belong in git. The webhook HMAC secret is **created by CloudFormation** (Secrets Manager `GenerateSecretString`) at deploy time. Lambdas receive the **ARN** only.
+## Secrets and security
 
-## Cost (leave running ~1 day)
+- **No secrets in git** — the webhook HMAC key is auto-generated by CloudFormation (`GenerateSecretString`) and stored in Secrets Manager. Lambda functions receive only the ARN.
+- **Webhook verification** — every incoming webhook is validated with HMAC-SHA256 over `timestamp.body` with a 5-minute replay window and timing-safe comparison.
+- **Idempotency** — `POST /listings` requires an `Idempotency-Key` header; a DynamoDB GSI prevents duplicate listings on retries. FIFO SQS deduplicates publish jobs on `publishRequestId`. Webhooks dedup on `eventId` via a conditional DynamoDB `PutItem`.
 
-Prototype-scale traffic is usually **well under a few dollars** for 24h: Lambda, HTTP API, DynamoDB on-demand, SQS, CloudFront data transfer, Secrets Manager (~$0.02/day of the monthly secret charge prorated), and S3. **NAT Gateway / idle ECS / provisioned RDS** are deliberately avoided. Re-check the [AWS pricing calculator](https://calculator.aws/) for your region.
+---
+
+## Cost
+
+**Prototype-scale (≤ 100 listings/day)**: well under **$0.20/day**.
+
+All services are pay-per-use: Lambda, HTTP API Gateway, DynamoDB on-demand, SQS, CloudFront, S3, Secrets Manager. No NAT Gateway, no idle ECS/RDS, no provisioned capacity. See [APPROACH.md](./APPROACH.md) for the full monthly cost breakdown at 10 sellers / 1k listings / 10k events.
+
+---
 
 ## Observability
 
-Three **CloudWatch alarms** are deployed with the stack (visible in the CloudWatch console):
+Three **CloudWatch alarms** are provisioned by the CDK stack:
 
-| Alarm | Condition |
-|-------|-----------|
-| `marketplace-api-lambda-errors` | API Lambda errors ≥ 5 in a 5-min window |
-| `marketplace-dlq-depth` | DLQ visible messages ≥ 1 |
-| `marketplace-mock-worker-errors` | Worker errors ≥ 10 in 5 min (synthetic ~15% expected) |
+| Alarm name | Triggers when |
+|-----------|---------------|
+| `marketplace-api-lambda-errors` | API Lambda errors ≥ 5 in 5 min |
+| `marketplace-dlq-depth` | DLQ has ≥ 1 visible message |
+| `marketplace-mock-worker-errors` | Worker errors ≥ 10 in 5 min |
 
-To receive email notifications, add an **SNS topic + email subscription** to each alarm in the CloudWatch console, or wire it in CDK before deploy.
+To route alarms to email, add an SNS topic + subscription in CDK (one-line change) before deploy.
 
-## Assumptions / judgement calls
+---
 
-- **CloudFront → API**: viewer path `/api/listings` is rewritten to `/listings` at the API origin so the browser can use relative `/api` URLs.  
-- **eBay** is the conceptual reference marketplace (see APPROACH.md); integration is fully mocked.  
-- **Auth**: omitted (nice-to-have in the brief); add API keys or Cognito before any real data.
+## API reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/listings` | All listings with their recent activity |
+| `POST` | `/listings` | Create listing + dispatch to mock marketplace |
+| `POST` | `/listings/analyze` | AI image analysis (single or bulk mode) |
+| `DELETE` | `/listings/:id` | Delete a listing and all its activity |
+| `POST` | `/listings/batch-delete` | Delete up to 50 listings at once |
+| `POST` | `/webhooks/marketplace` | Ingest signed marketplace event |
+| `POST` | `/admin/replay-dlq` | Re-enqueue messages from the DLQ |
+
+---
 
 ## Project layout
 
-- `infra/` — CDK stack, Lambda handlers (`infra/lambda/`)  
-- `frontend/public/` — static UI copied to `frontend/dist` on build  
-- `scripts/smoke-test.mjs` — optional post-deploy check  
+```
+├── infra/
+│   ├── bin/app.ts               # CDK entry point
+│   ├── lib/marketplace-stack.ts # All infrastructure (one stack)
+│   └── lambda/
+│       ├── api-handler.ts       # Main API + webhook receiver
+│       ├── mock-accept.ts       # Mock marketplace ingress
+│       ├── mock-worker.ts       # Async worker (delays, failures, webhooks)
+│       └── shared.ts            # HMAC helpers, CORS headers
+├── frontend/
+│   └── public/                  # index.html · styles.css · app.js
+├── scripts/
+│   └── smoke-test.mjs           # Post-deploy integration test
+├── APPROACH.md                  # Architecture, safety, cost write-up
+└── README.md                    # This file
+```
+
+---
+
+## Judgement calls
+
+- **Auth omitted** — basic auth was prototyped (shared token via Secrets Manager) but removed to keep the demo frictionless. Production direction: Cognito + `sellerId` on every DynamoDB row.
+- **CloudFront → API path rewrite** — viewer requests to `/api/*` are stripped of the `/api` prefix by a CloudFront Function before forwarding to API Gateway. This lets the browser use a single origin with no CORS preflight on same-host requests.
+- **Single region** — `us-west-2` (Oregon). Multi-region and multi-account are out of scope per the brief.
+- **No real marketplace OAuth** — eBay is the conceptual reference; see APPROACH.md for the real auth/rate-limit story.

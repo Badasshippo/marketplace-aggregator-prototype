@@ -1,95 +1,135 @@
-# Marketplace aggregator — approach (Variant 2)
+# Marketplace Aggregator — Approach Document
+**Variant 2 · Senior Engineer Assignment**
+
+---
 
 ## Approach summary
 
-This prototype is **API-driven with an asynchronous integration boundary**: our control plane exposes a small HTTP API and DynamoDB-backed state, while a **mock third-party marketplace** owns its own ingress (Lambda function URL), internal queue (FIFO SQS), and delivery semantics. That split mirrors how we would wrap real marketplaces—HTTP + webhooks, opaque retries, and idiosyncratic failure modes—without coupling our core domain model to Lambda-only tricks. An agentic layer could sit on top later for seller support workflows, but the **durable contract** between us and partners stays request/response + signed callbacks.
+This prototype is **API-driven with a message-driven integration boundary**. The seller-facing control plane (HTTP API + DynamoDB) owns its own state and exposes clean REST semantics, while the mock marketplace sits behind a completely separate ingress (Lambda function URL) with its own queue, retry loop, and webhook delivery. That split deliberately mirrors how a real eBay or Facebook integration works in production: our system never knows when the partner will respond, how many times it will retry, or what shape its errors take. The boundary is an HTTP call out and a signed webhook back — the same contract a real adapter would expose. An agentic orchestration layer (LLM-driven task routing for buyer questions, price negotiation, etc.) could sit on top of this without touching the core publish/event pipeline.
+
+---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  subgraph browser [Browser]
-    UI[Static UI S3 CloudFront]
-  end
-  subgraph our [Our system]
-    CF[CloudFront /api strip]
-    API[HTTP API Lambda]
-    DDB[(DynamoDB listings activity)]
-    SEC[Secrets Manager HMAC]
-  end
-  subgraph mock [Mock marketplace]
-    MURL[Lambda URL mock publish]
-    Q[FIFO SQS]
-    W[Worker Lambda]
-  end
-  UI -->|"/api/*"| CF
-  CF --> API
-  API --> DDB
-  API -->|POST 202| MURL
-  MURL --> Q
-  W --> Q
-  W -->|signed webhook| API
-  API --> SEC
-  API --> DDB
+```
+Browser (CloudFront)
+    │
+    │  /api/* → strip /api → API Gateway
+    ▼
+┌──────────────────────────────────────┐
+│           Our system                 │
+│                                      │
+│  HTTP API + Lambda (api-handler)     │
+│    POST /listings      → DynamoDB    │
+│    GET  /listings      ← DynamoDB    │
+│    DELETE /listings/:id → DynamoDB   │
+│    POST /listings/analyze → Bedrock  │
+│    POST /webhooks/marketplace        │
+│          ↓ HMAC verify               │
+│          → DynamoDB (activity feed)  │
+│                                      │
+│  DynamoDB                            │
+│    listings table  (listings + GSI)  │
+│    activity table  (per-listing feed)│
+│                                      │
+│  Secrets Manager                     │
+│    webhook HMAC secret               │
+└──────────┬───────────────────────────┘
+           │ POST /publish (202)
+           ▼
+┌──────────────────────────────────────┐
+│        Mock marketplace              │
+│  (separate Lambda function URL)      │
+│                                      │
+│  mock-accept  → FIFO SQS             │
+│  mock-worker ← SQS (batchSize=1)    │
+│    • 1.5–4s async delay              │
+│    • ~15% synthetic failure → retry  │
+│    • DLQ after 6 receives            │
+│    • POST new_comment (signed)       │
+│    • POST item_sold   (signed)       │
+└──────────────────────────────────────┘
 ```
 
-**AWS choices (and why)**
+**AWS service choices**
 
-| Service | Role |
-|--------|------|
-| **API Gateway HTTP API + Lambda** | Pay-per-use API; no idle cost; fine for low/moderate QPS. |
-| **DynamoDB on-demand** | Two small tables (listings + activity); no provisioned capacity burn. |
-| **SQS FIFO + DLQ** | Models async partner work, dedupes by `publishRequestId`, surfaces poison messages. |
-| **Secrets Manager** | Webhook signing secret generated at deploy—nothing sensitive in git. |
-| **S3 + CloudFront** | Cheap static hosting; `/api/*` routed to API Gateway via a tiny CloudFront Function. |
-| **Lambda function URL (mock ingress)** | Clean “external” entrypoint without circular deps on our API URL. |
+| Service | Reason |
+|---------|--------|
+| **API Gateway HTTP API** | ~70% cheaper than REST API; no provisioned capacity; native CORS; HTTP API Lambda proxy is sufficient for this payload shape. |
+| **Lambda (Node 20 + esbuild)** | Sub-100ms cold starts for light handlers; pay-per-invocation; no idle cost. Bundled by CDK NodejsFunction. |
+| **DynamoDB on-demand** | Two small tables; on-demand billing avoids provisioned WCU waste at low volume. GSI for idempotency-key lookup without a full Scan. |
+| **SQS FIFO + DLQ** | Per-listing `MessageGroupId` preserves order; `MessageDeduplicationId` (publishRequestId) prevents double-enqueue on retries. DLQ exposes poison messages without code. |
+| **Secrets Manager** | HMAC signing key generated by CloudFormation at deploy time — zero secrets ever touch the repo or env vars. Lambdas receive only the ARN. |
+| **S3 + CloudFront** | Static hosting at near-zero marginal cost; `/api/*` routed to API Gateway via a CloudFront Function (one-line path rewrite). Security headers policy on the S3 origin (X-Content-Type-Options, X-Frame-Options, Referrer-Policy). |
+| **Lambda function URL (mock ingress)** | Gives the mock marketplace its own stable HTTPS entrypoint that our API Lambda calls — a clean module boundary with no circular CloudFormation dependency on the main API URL. |
+| **Amazon Bedrock (Claude Haiku 4.5)** | Per-image pricing (~$0.0004/image); no idle infrastructure; IAM-controlled via a scoped `bedrock:InvokeModel` policy. Used for AI-assisted listing creation — single-item and bulk (up to 10 items from one photo). |
+| **CloudWatch Alarms (3)** | API Lambda errors, DLQ depth, mock worker errors — deployed via CDK so they exist from day one, not as an afterthought. |
+
+---
 
 ## Reference marketplace: eBay
 
-**Why eBay (conceptual)**  
-Mature Sell APIs, high seller volume, and a long history of rate limits and webhook-style notifications make it a good **stress template** for idempotency, retries, and signature verification—even though this build only mocks it.
+**Why eBay**
+eBay's Sell APIs have the longest history of rate-limit enforcement, webhook-style notification schemes, and idempotency requirements of any major marketplace. Using it as the conceptual reference forces honest thinking about retry semantics, signature verification, and partial publish failures — all the hard parts. Facebook Marketplace has no public Sell API; Amazon requires a separate MWS/SP-API approval process with longer lead time.
 
-**Auth model (real world)**  
-OAuth 2.0 (authorization code / refresh tokens), per-developer app keys, delegated seller consent. Tokens are short-lived; refresh handling and per-seller token storage are mandatory in production.
+**Auth model (real world)**
+OAuth 2.0 with authorization code flow. Short-lived access tokens (2h), long-lived refresh tokens (18 months). Per-application `client_id/client_secret` in Secrets Manager; per-seller refresh tokens stored encrypted per tenant. Token refresh must be handled transparently by the adapter layer before every outbound call.
 
-**Rate limits**  
-Sell APIs are tiered; bursts and daily caps apply per application and endpoint. A central **token bucket / scheduler** per seller+marketplace avoids 429 storms and backoff collisions.
+**Rate limits**
+eBay Sell APIs enforce per-application daily call quotas and per-endpoint burst limits (varies by tier). A central **token-bucket scheduler per seller×marketplace** is necessary to avoid 429 storms and to sequence dependent calls (create listing → upload media → publish).
 
-**Webhooks / notifications**  
-eBay’s notification platforms (legacy and newer schemes) deliver out-of-band events; partners must **verify signatures**, handle duplicates, and tolerate delayed delivery.
+**Webhooks / Account Deletion Notifications**
+eBay delivers marketplace events out-of-band via HTTP POST. Partners must validate `X-EBAY-SIGNATURE` (HMAC-SHA256), handle duplicate event IDs, and tolerate delivery delays of minutes to hours. Our webhook receiver already does all three: HMAC with 5-minute replay window, `eventId`-based deduplication via DynamoDB conditional write.
 
-**Pitfalls**  
-Category/condition taxonomy drift, mandatory item specifics, media hosting rules, partial failures on multi-step publishes, and marketplace-specific business logic (returns, managed payments) that cannot be abstracted naively behind a single DTO.
+**Pitfalls**
+Category and item-specifics taxonomy changes without warning; mandatory fields vary by category; media must be hosted on eBay CDN after upload; managed payments introduced business-logic coupling; partial failures on multi-step publish require a compensating rollback or retry-from-step-N strategy.
+
+---
 
 ## Safety
 
 | Topic | Prototype | Production direction |
-|-------|-----------|----------------------|
-| **Credentials** | Only AWS-generated webhook secret in Secrets Manager; no tokens in repo. | Per-tenant secrets (SSM/Secrets Manager); KMS CMKs; rotation. |
-| **Isolation** | Single-table logical tenant (`sellerId` would be added). | Partition key includes `tenantId` / `sellerId`; IAM scoping; row-level patterns in DDB. |
-| **Publish idempotency** | Client `Idempotency-Key` + GSI lookup; FIFO dedupe on `publishRequestId`. | Store partner listing id; reconcile state machine; bounded retries with jitter. |
-| **Webhook verification** | HMAC-SHA256 over `timestamp.body` with 5-minute skew check. | Partner-specific schemes; replay windows; optional key rotation. |
-| **Retries / DLQ** | ~15% synthetic failure in worker; SQS redrive to DLQ after 6 receives. | Alert on DLQ depth; replay tooling; idempotent event IDs (`eventId`). |
-| **Abuse** | Open mock URL (prototype). | Auth on ingress (SigV4, API keys), WAF on CloudFront, request size limits. |
+|-------|-----------|---------------------|
+| **Secrets** | HMAC key auto-generated by CloudFormation in Secrets Manager; ARN passed to Lambda via env var only. Nothing sensitive in git or Lambda console. | Per-tenant marketplace tokens in Secrets Manager with KMS CMK; automatic rotation; audit trail via CloudTrail. |
+| **Idempotency** | Client sends `Idempotency-Key` header; API checks GSI before writing; FIFO SQS deduplicates on `publishRequestId`; webhook events deduped on `eventId` via conditional PutItem. | Partner listing ID stored on first success; state machine reconciles on restart; bounded retry with exponential backoff + jitter. |
+| **Webhook security** | HMAC-SHA256 over `timestamp.body`; 5-minute skew window; timing-safe compare. | Partner-specific schemes (eBay uses its own signing protocol); key rotation with overlap period; WAF on CloudFront. |
+| **Multi-tenancy** | Not implemented in prototype (single seller assumed). | `sellerId` on every DynamoDB partition key; IAM session policies scoped per tenant; VPC + PrivateLink for data-plane isolation if needed. |
+| **Abuse** | Mock ingress is open (prototype trade-off). API routes are open (auth was prototyped and removed to simplify the demo). | API keys or Cognito JWT on all routes; SigV4 or API key on mock ingress; WAF rate-limit on CloudFront. |
 
-## Cost (rough)
+---
 
-Assumptions: **10 sellers, 1k listings, 10k activity events/month** (well within free tiers for many components).
+## Cost
 
-- **Lambda**: sub-dollar at this volume (invocation + duration).  
-- **API Gateway HTTP API**: cents to low dollars for request count.  
-- **DynamoDB on-demand**: storage + request units—typically **single-digit USD** unless hot partitions.  
-- **CloudFront + S3**: low traffic → **&lt; $5/month** often dominated by request minimums.  
-- **Secrets Manager**: ~$0.40/secret/month + API calls (small).  
-- **SQS FIFO**: cheap at this scale.
+**Assumptions: 10 sellers · 1,000 listings/month · 10,000 webhook events/month**
 
-**First cost wall**  
-Heavy **CloudFront + API request volume**, **DynamoDB hot partitions** (needs key design + caching), or **always-on networking** (NAT, idle ECS/EKS, provisioned Aurora). This stack avoids NAT and provisioned DB on purpose.
+| Component | Est. monthly |
+|-----------|-------------|
+| Lambda (invocations + duration) | < $0.10 |
+| API Gateway HTTP API | < $0.04 (400k requests free tier) |
+| DynamoDB on-demand | < $1 (read/write units + storage) |
+| SQS FIFO | < $0.01 |
+| CloudFront + S3 | < $1 (1TB egress free on CF) |
+| Secrets Manager | ~$0.40/secret/month × 1 = $0.40 |
+| Bedrock Claude Haiku 4.5 | ~$0.001 per listing analyzed (optional) |
+| CloudWatch (alarms + logs) | < $1 |
+| **Total** | **~$2–4/month** |
 
-## What I would cut vs build next
+**First cost wall**: CloudFront egress at volume (> 1TB/month), DynamoDB hot partitions needing provisioned capacity, or a Lambda concurrency burst requiring reserved capacity. None of those apply at 10 sellers.
 
-**Cut for a hackathon**  
-Custom domains, multi-region, Cognito, Step Functions choreography, full observability suite.
+**Per-day running cost of this prototype**: < $0.20.
 
-**Build next for a real product**  
-Seller auth (Cognito/Auth.js), explicit `sellerId` on all rows, marketplace capability matrix, outbound publish state machine with per-marketplace adapters, webhook replay + signing key rotation, CloudWatch alarms (5xx, DLQ depth, Lambda throttles, API 4xx spikes), and a minimal integration test suite running in CI against a disposable stack.
+---
+
+## What I would cut vs. build next
+
+**Cut for a one-day prototype (already cut)**
+Custom domains, Cognito auth flows, multi-region, Step Functions choreography, media upload to S3/CDN, marketplace capability matrix, CI/CD pipeline.
+
+**Build next (in priority order)**
+1. **Seller auth** — Cognito or Auth.js; `sellerId` on every DynamoDB row; scoped IAM.
+2. **Marketplace adapter interface** — a typed `MarketplaceAdapter` contract so eBay, Facebook (if they add an API), and Etsy each get their own implementation behind the same boundary.
+3. **Publish state machine** — Step Functions Express workflow for create → upload-media → activate → confirm; compensating rollback on failure.
+4. **Webhook signing key rotation** — overlap window so in-flight events don't break during rotation.
+5. **CI smoke test** — the existing `scripts/smoke-test.mjs` run against a ephemeral CDK stack in GitHub Actions on every PR.
+6. **Observability hardening** — structured JSON logs (correlation IDs), X-Ray tracing across Lambda hops, SNS + PagerDuty on DLQ alarm.
+7. **Buyer event routing** — pipe `new_question`, `price_change_request`, `return_request` into the activity feed and surface action-required states to the seller.

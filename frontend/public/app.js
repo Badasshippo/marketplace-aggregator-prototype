@@ -5,7 +5,8 @@ const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 let pollId = 0, inFlight = false, hadFirstLoad = false, pollHandle = 0;
 let selectionMode = false;
 const selectedIds = new Set();
-const sessionPhotos = new Map(); // listingId → objectURL (session only)
+let singlePhotoUrlPromise = null; // resolves to S3 URL after upload
+let bulkPhotoUrlPromise = null;   // resolves to S3 URL after upload
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 
@@ -104,19 +105,36 @@ function pipelineNode(status, acts) {
   return "";
 }
 
+// ── Utilities ──────────────────────────────────────────────────────────────
+
+function titleGradient(title) {
+  let h = 5381;
+  for (let i = 0; i < (title || "").length; i++) h = ((h << 5) + h) ^ title.charCodeAt(i);
+  const hue = Math.abs(h) % 360;
+  return `linear-gradient(145deg, hsl(${hue},40%,18%) 0%, hsl(${(hue + 45) % 360},35%,13%) 100%)`;
+}
+
 // ── Listing card ───────────────────────────────────────────────────────────
+
+const CONDITION_COLOR = { "New": "#30d158", "Like New": "#34c8e0", "Good": "#5d7dff", "Fair": "#ff9f0a", "Poor": "#ff453a" };
 
 function renderCard(l) {
   const acts = (l.recentActivity || []).slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  const imgHref = safeImageUrl(l.photoUrl) ?? sessionPhotos.get(l.listingId) ?? null;
+  const imgHref = safeImageUrl(l.photoUrl) ?? null;
+  const isSoldCard = l.status === "sold";
   const statusLabel = l.status.replace(/_/g, " ");
   const badgeCls = `badge badge--${l.status.replace(/[^a-z0-9_]/gi, "_")}`;
   const selCls = selectionMode ? " selection-mode" : "";
   const selChecked = selectedIds.has(l.listingId) ? "checked" : "";
+  const initials = (l.title || "?").slice(0, 2).toUpperCase();
 
   const mediaHtml = imgHref
-    ? `<img class="listing-card__img" src="${attrEscape(imgHref)}" alt="" loading="lazy" title="Click to enlarge" />`
-    : `<div class="listing-card__img-ph" aria-hidden="true"><span style="font-size:1.8rem">📷</span></div>`;
+    ? `<img class="listing-card__img${isSoldCard ? " is-sold-img" : ""}" src="${attrEscape(imgHref)}" alt="" loading="lazy" title="Click to enlarge" />
+       ${isSoldCard ? `<div class="sold-overlay" aria-hidden="true"><span>SOLD</span></div>` : ""}`
+    : `<div class="listing-card__img-ph" style="background:${titleGradient(l.title)}" aria-hidden="true">
+         <span class="listing-card__initials">${escapeHtml(initials)}</span>
+         ${isSoldCard ? `<div class="sold-overlay" aria-hidden="true"><span>SOLD</span></div>` : ""}
+       </div>`;
 
   let actHtml = "";
   if (acts.length) {
@@ -168,7 +186,8 @@ function renderCard(l) {
       const ph = document.createElement("div");
       ph.className = "listing-card__img-ph";
       ph.setAttribute("aria-hidden", "true");
-      ph.innerHTML = `<span style="font-size:1.8rem">📷</span>`;
+      ph.style.background = titleGradient(l.title);
+      ph.innerHTML = `<span class="listing-card__initials">${escapeHtml(initials)}</span>${isSoldCard ? `<div class="sold-overlay" aria-hidden="true"><span>SOLD</span></div>` : ""}`;
       img.replaceWith(ph);
     });
     img.addEventListener("click", () => openLightbox(img.src));
@@ -243,6 +262,8 @@ function exitSelectionMode() {
   selectedIds.clear();
   document.getElementById("selection-toolbar")?.setAttribute("hidden", "");
   document.getElementById("normal-controls")?.removeAttribute("hidden");
+  const selAllBtn = document.getElementById("select-all-listings-btn");
+  if (selAllBtn) selAllBtn.textContent = "Select all";
   updateSelectionUI();
   renderListings(lastData);
 }
@@ -257,6 +278,21 @@ function updateSelectionUI() {
 
 document.getElementById("select-mode-btn")?.addEventListener("click", enterSelectionMode);
 document.getElementById("cancel-selection-btn")?.addEventListener("click", exitSelectionMode);
+
+document.getElementById("select-all-listings-btn")?.addEventListener("click", () => {
+  const allIds = lastData.listings?.map(l => l.listingId) ?? [];
+  const btn = document.getElementById("select-all-listings-btn");
+  const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id));
+  if (allSelected) {
+    selectedIds.clear();
+    if (btn) btn.textContent = "Select all";
+  } else {
+    allIds.forEach(id => selectedIds.add(id));
+    if (btn) btn.textContent = "Deselect all";
+  }
+  renderListings(lastData);
+  updateSelectionUI();
+});
 
 document.getElementById("delete-selected-btn")?.addEventListener("click", async () => {
   const ids = [...selectedIds];
@@ -366,6 +402,24 @@ initCounter("f-desc", "desc-count", 4000);
 
 const BEDROCK_NATIVE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
+// Upload a file to S3 via presigned PUT URL, returns the public photo URL.
+async function uploadPhotoToS3(file) {
+  const { imageBase64, mediaType } = await compressImage(file);
+  const { uploadUrl, photoUrl } = await api("/listings/photo-upload-url", {
+    method: "POST",
+    body: JSON.stringify({ mediaType }),
+  });
+  // Convert base64 back to binary for the S3 PUT
+  const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+  const res = await fetch(uploadUrl, {
+    method: "PUT",
+    body: new Blob([bytes], { type: mediaType }),
+    headers: { "Content-Type": mediaType },
+  });
+  if (!res.ok) throw new Error(`S3 upload failed: ${res.status}`);
+  return photoUrl;
+}
+
 async function compressImage(file, maxBytes = 3.5 * 1024 * 1024) {
   const needsConvert = !BEDROCK_NATIVE.has(file.type);
   if (!needsConvert && file.size <= maxBytes) {
@@ -387,7 +441,7 @@ async function compressImage(file, maxBytes = 3.5 * 1024 * 1024) {
 
 // ── AI single item ──────────────────────────────────────────────────────────
 
-function wirePhotoZone({ inputId, pickBtnId, changeBtnId, previewId, placeholderId, analyzeBtnId, analyzeLabelId, analyzeStatusId, onAnalyze }) {
+function wirePhotoZone({ inputId, pickBtnId, changeBtnId, previewId, placeholderId, analyzeBtnId, analyzeLabelId, analyzeStatusId, onAnalyze, onPhotoUrlReady }) {
   const photoInput = document.getElementById(inputId);
   const pickBtn = document.getElementById(pickBtnId);
   const changeBtn = document.getElementById(changeBtnId);
@@ -405,15 +459,34 @@ function wirePhotoZone({ inputId, pickBtnId, changeBtnId, previewId, placeholder
     changeBtn.setAttribute("hidden", "");
     if (analyzeBtn) analyzeBtn.disabled = true;
     if (analyzeStatus) { analyzeStatus.textContent = ""; analyzeStatus.className = "ai-status"; }
+    if (onPhotoUrlReady) onPhotoUrlReady(null);
   });
   photoInput?.addEventListener("change", () => {
     const file = photoInput.files?.[0]; if (!file) return;
-    const url = URL.createObjectURL(file);
-    if (preview) { preview.src = url; preview.removeAttribute("hidden"); }
+    if (preview) { preview.src = URL.createObjectURL(file); preview.removeAttribute("hidden"); }
     placeholder?.setAttribute("hidden", "");
     changeBtn?.removeAttribute("hidden");
     if (analyzeBtn) analyzeBtn.disabled = false;
-    if (analyzeStatus) { analyzeStatus.textContent = ""; analyzeStatus.className = "ai-status"; }
+    if (analyzeStatus) { analyzeStatus.textContent = "⬆ Uploading photo…"; analyzeStatus.className = "ai-status"; }
+    // Fire-and-forget S3 upload — resolves before user clicks Analyze
+    const promise = uploadPhotoToS3(file).then((url) => {
+      if (analyzeStatus && analyzeStatus.textContent.startsWith("⬆")) {
+        analyzeStatus.textContent = "Photo ready.";
+        analyzeStatus.className = "ai-status ok";
+      }
+      if (onPhotoUrlReady) onPhotoUrlReady(url);
+      return url;
+    }).catch((e) => {
+      console.warn("S3 upload failed, continuing without stored image URL:", e);
+      if (analyzeStatus && analyzeStatus.textContent.startsWith("⬆")) {
+        analyzeStatus.textContent = "";
+        analyzeStatus.className = "ai-status";
+      }
+      if (onPhotoUrlReady) onPhotoUrlReady(null);
+      return null;
+    });
+    if (inputId === "photo-input") singlePhotoUrlPromise = promise;
+    else bulkPhotoUrlPromise = promise;
   });
   analyzeBtn?.addEventListener("click", async () => {
     const file = photoInput?.files?.[0]; if (!file) return;
@@ -445,22 +518,23 @@ wirePhotoZone({
     document.getElementById("f-desc").value = s.description ?? "";
     document.getElementById("f-price").value = s.suggestedPriceCents ? (s.suggestedPriceCents / 100).toFixed(2) : "";
     ["f-title", "f-desc"].forEach(id => document.getElementById(id)?.dispatchEvent(new Event("input")));
+    const photoUrl = await singlePhotoUrlPromise;
+    if (photoUrl) document.getElementById("f-photo").value = photoUrl;
     switchTab("manual");
     document.getElementById("f-title").focus();
-    toast("✨ AI filled the form — review, edit, then publish.", "ok");
+    const conditionMsg = s.condition ? ` · Condition: ${s.condition}` : "";
+    toast(`✨ AI filled the form${conditionMsg} — review, edit, then publish.`, "ok", 6000);
   }
 });
 
 // ── AI bulk ─────────────────────────────────────────────────────────────────
 
-let bulkSessionUrl = null;
-
 wirePhotoZone({
   inputId: "bulk-photo-input", pickBtnId: "bulk-photo-pick-btn", changeBtnId: "bulk-photo-change-btn",
   previewId: "bulk-photo-preview", placeholderId: "bulk-photo-placeholder",
   analyzeBtnId: "bulk-analyze-btn", analyzeLabelId: "bulk-analyze-label", analyzeStatusId: "bulk-analyze-status",
-  onAnalyze: async ({ imageBase64, mediaType }, file) => {
-    bulkSessionUrl = URL.createObjectURL(file);
+  onPhotoUrlReady: (url) => { /* bulkPhotoUrlPromise updated by wirePhotoZone itself */ void url; },
+  onAnalyze: async ({ imageBase64, mediaType }, _file) => {
     const statusEl = document.getElementById("bulk-analyze-status");
     if (statusEl) { statusEl.textContent = "Claude is identifying items…"; statusEl.className = "ai-status"; }
     const result = await api("/listings/analyze", { method: "POST", body: JSON.stringify({ imageBase64, mediaType, bulk: true }) });
@@ -533,19 +607,23 @@ document.getElementById("bulk-publish-btn")?.addEventListener("click", async () 
   if (label) label.textContent = `Publishing 0 / ${toPublish.length}…`;
 
   let done = 0;
+  // Await S3 photo URL (usually already resolved since upload started when user picked file)
+  const bulkPhotoUrl = await (bulkPhotoUrlPromise ?? Promise.resolve(null));
+
   // Stagger requests 300ms apart so Lambda + mock URL don't all cold-start at once
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const results = await Promise.allSettled(toPublish.map(async (item, idx) => {
     await sleep(idx * 300);
     const progEl = document.getElementById(`bulk-item-progress-${item.idx}`);
     const idem = newIdem();
+    const body = { title: item.title, description: item.description, price: item.price };
+    if (bulkPhotoUrl) body.photoUrl = bulkPhotoUrl;
     try {
-      const r = await api("/listings", {
+      await api("/listings", {
         method: "POST",
         headers: { "idempotency-key": idem },
-        body: JSON.stringify({ title: item.title, description: item.description, price: item.price }),
+        body: JSON.stringify(body),
       });
-      if (bulkSessionUrl) sessionPhotos.set(r.listing?.listingId, bulkSessionUrl);
       if (progEl) { progEl.textContent = "✓ Sent to mock eBay"; progEl.className = "bulk-item__progress is-ok"; }
       done++;
       if (label) label.textContent = `Publishing ${done} / ${toPublish.length}…`;

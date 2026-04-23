@@ -840,11 +840,42 @@ textarea { resize: vertical; min-height: 90px; }
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-3);
-  font-size: 0.72rem;
-  text-align: center;
-  padding: 0.5rem;
+  position: relative;
+  overflow: hidden;
 }
+
+.listing-card__initials {
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  color: rgba(255,255,255,0.35);
+  user-select: none;
+}
+
+/* ── Sold overlay on image ───────────────────────────────────────────────── */
+.listing-card__media { position: relative; }
+
+.sold-overlay {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--ok) 80%, black);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sold-overlay span {
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.4);
+  writing-mode: vertical-lr;
+  transform: rotate(180deg);
+}
+
+.listing-card__img.is-sold-img { filter: brightness(0.7); }
 
 .listing-card__body {
   flex: 1;

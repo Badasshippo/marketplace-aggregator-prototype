@@ -88,6 +88,29 @@ export class MarketplaceStack extends cdk.Stack {
       },
     });
 
+    // S3 bucket for user-uploaded product photos (presigned PUT, public GET)
+    const photosBucket = new s3.Bucket(this, "PhotosBucket", {
+      blockPublicAccess: new s3.BlockPublicAccess({
+        blockPublicAcls: true,
+        ignorePublicAcls: true,
+        blockPublicPolicy: false,
+        restrictPublicBuckets: false,
+      }),
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.PUT],
+          allowedOrigins: ["*"],
+          allowedHeaders: ["content-type", "x-amz-date", "authorization", "x-api-key"],
+          maxAge: 3000,
+        },
+      ],
+      lifecycleRules: [{ expiration: cdk.Duration.days(30) }],
+    });
+    photosBucket.grantPublicAccess("photos/*");
+
     const apiFn = new lambdaNode.NodejsFunction(this, "ApiFn", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: lambdaEntry("api-handler.ts"),
@@ -102,6 +125,8 @@ export class MarketplaceStack extends cdk.Stack {
         WEBHOOK_SECRET_ARN: webhookSecret.secretArn,
         MOCK_DLQ_URL: mockDlq.queueUrl,
         MOCK_QUEUE_URL: mockQueue.queueUrl,
+        PHOTOS_BUCKET: photosBucket.bucketName,
+        PHOTOS_BASE_URL: `https://${photosBucket.bucketRegionalDomainName}`,
       },
       logRetention: logs.RetentionDays.THREE_DAYS,
     });
@@ -110,6 +135,7 @@ export class MarketplaceStack extends cdk.Stack {
     webhookSecret.grantRead(apiFn);
     mockDlq.grantConsumeMessages(apiFn);
     mockQueue.grantSendMessages(apiFn);
+    photosBucket.grantPut(apiFn);
     apiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
@@ -156,6 +182,11 @@ export class MarketplaceStack extends cdk.Stack {
     });
     httpApi.addRoutes({
       path: "/listings/analyze",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/listings/photo-upload-url",
       methods: [apigwv2.HttpMethod.POST],
       integration: apiIntegration,
     });
@@ -335,6 +366,10 @@ export class MarketplaceStack extends cdk.Stack {
     new cdk.CfnOutput(this, "WebhookSecretArn", {
       value: webhookSecret.secretArn,
       description: "Secrets Manager ARN (generated at deploy; not in git)",
+    });
+    new cdk.CfnOutput(this, "PhotosBucketName", {
+      value: photosBucket.bucketName,
+      description: "S3 bucket for user-uploaded product photos",
     });
   }
 }
