@@ -61,7 +61,7 @@ export class MarketplaceStack extends cdk.Stack {
     const mockQueue = new sqs.Queue(this, "MockPublishQueue", {
       fifo: true,
       contentBasedDeduplication: false,
-      visibilityTimeout: cdk.Duration.seconds(60),
+      visibilityTimeout: cdk.Duration.seconds(360), // must be >= Lambda timeout
       deadLetterQueue: { maxReceiveCount: 6, queue: mockDlq },
     });
 
@@ -210,7 +210,7 @@ export class MarketplaceStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: lambdaEntry("mock-worker.ts"),
       handler: "handler",
-      timeout: cdk.Duration.seconds(60),
+      timeout: cdk.Duration.seconds(300), // 5 min — gives room for realistic delays between events
       memorySize: 256,
       // No reserved concurrency: new accounts often have low regional limits; reserving
       // capacity can push unreserved below the account minimum. Throttle via SQS maxConcurrency instead.

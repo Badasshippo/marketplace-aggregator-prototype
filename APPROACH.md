@@ -69,8 +69,6 @@ Browser (CloudFront)
 
 ## Reference marketplace: eBay
 
-**Why eBay**
-eBay's Sell APIs have the longest history of rate-limit enforcement, webhook-style notification schemes, and idempotency requirements of any major marketplace. Using it as the conceptual reference forces honest thinking about retry semantics, signature verification, and partial publish failures — all the hard parts. Facebook Marketplace has no public Sell API; Amazon requires a separate MWS/SP-API approval process with longer lead time.
 
 **Auth model (real world)**
 OAuth 2.0 with authorization code flow. Short-lived access tokens (2h), long-lived refresh tokens (18 months). Per-application `client_id/client_secret` in Secrets Manager; per-seller refresh tokens stored encrypted per tenant. Token refresh must be handled transparently by the adapter layer before every outbound call.
@@ -125,11 +123,3 @@ Category and item-specifics taxonomy changes without warning; mandatory fields v
 **Cut for a one-day prototype (already cut)**
 Custom domains, Cognito auth flows, multi-region, Step Functions choreography, media upload to S3/CDN, marketplace capability matrix, CI/CD pipeline.
 
-**Build next (in priority order)**
-1. **Seller auth** — Cognito or Auth.js; `sellerId` on every DynamoDB row; scoped IAM.
-2. **Marketplace adapter interface** — a typed `MarketplaceAdapter` contract so eBay, Facebook (if they add an API), and Etsy each get their own implementation behind the same boundary.
-3. **Publish state machine** — Step Functions Express workflow for create → upload-media → activate → confirm; compensating rollback on failure.
-4. **Webhook signing key rotation** — overlap window so in-flight events don't break during rotation.
-5. **CI smoke test** — the existing `scripts/smoke-test.mjs` run against a ephemeral CDK stack in GitHub Actions on every PR.
-6. **Observability hardening** — structured JSON logs (correlation IDs), X-Ray tracing across Lambda hops, SNS + PagerDuty on DLQ alarm.
-7. **Buyer event routing** — pipe `new_question`, `price_change_request`, `return_request` into the activity feed and surface action-required states to the seller.

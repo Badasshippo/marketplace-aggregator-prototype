@@ -91,14 +91,16 @@ function setConnectionState(mode) {
 
 function pipelineNode(status, acts) {
   const soldEv = acts?.some(a => a.type === "item_sold");
-  const cmt = acts?.some(a => a.type === "new_comment");
+  const hasActivity = acts?.some(a => ["new_comment","new_question","price_change_request"].includes(a.type));
   const step = (lbl, cls) => `<span class="pipeline__step ${cls}"><span class="pipeline__dot"></span>${lbl}</span>`;
   const line = (cls = "") => `<span class="pipeline__line ${cls}"></span>`;
   if (status === "publish_dispatch_failed")
     return `<div class="pipeline">${step("Submit","is-err")}${line("is-err")}${step("Failed","is-err")}</div>`;
   if (status === "sold" || soldEv)
     return `<div class="pipeline">${step("Submit","is-done")}${line("is-done")}${step("Live","is-done")}${line("is-done")}${step("Sold","is-done")}</div>`;
-  if (status === "live" || cmt)
+  if (status === "pending_review")
+    return `<div class="pipeline">${step("Submit","is-done")}${line("is-done")}${step("Live","is-done")}${line("is-wait")}${step("Action needed","is-wait")}</div>`;
+  if (status === "live" || hasActivity)
     return `<div class="pipeline">${step("Submit","is-done")}${line("is-done")}${step("Live","is-done")}${line()}${step("Sold","")}</div>`;
   if (status === "publishing" || status === "pending_publish")
     return `<div class="pipeline">${step("Submit","is-done")}${line("is-wait")}${step("Live","is-wait")}${line()}${step("Sold","")}</div>`;
@@ -139,18 +141,53 @@ function renderCard(l) {
   let actHtml = "";
   if (acts.length) {
     actHtml = acts.map(a => {
-      const isCmt = a.type === "new_comment", isSold = a.type === "item_sold";
-      const icon = isCmt ? "💬" : isSold ? "💰" : "📋";
-      const iconCls = isCmt ? "activity-item__icon--comment" : isSold ? "activity-item__icon--sold" : "activity-item__icon--other";
-      const title = isCmt ? "New comment" : isSold ? "Item sold" : escapeHtml(a.type);
-      const detail = isCmt
-        ? `<span class="activity-item__detail">${escapeHtml(String(a.payload?.comment || ""))}</span>`
-        : isSold ? `<span class="activity-item__detail">ID: <code>${escapeHtml(String(a.payload?.marketplaceListingId || "—"))}</code></span>` : "";
+      const type = a.type;
+      const p = a.payload ?? {};
+      const isCmt = type === "new_comment";
+      const isSold = type === "item_sold";
+      const isQ = type === "new_question";
+      const isPriceReq = type === "price_change_request";
+
+      const icon = isCmt ? "💬" : isSold ? "💰" : isQ ? "🙋" : isPriceReq ? "💲" : "📋";
+      const iconCls = isCmt ? "activity-item__icon--comment"
+        : isSold ? "activity-item__icon--sold"
+        : isQ ? "activity-item__icon--question"
+        : isPriceReq ? "activity-item__icon--price"
+        : "activity-item__icon--other";
+      const title = isCmt ? "New comment"
+        : isSold ? "Item sold"
+        : isQ ? "Buyer question"
+        : isPriceReq ? "Price change request"
+        : escapeHtml(type);
+
+      let detail = "";
+      if (isCmt) detail = `<span class="activity-item__detail">${escapeHtml(String(p.comment || ""))}</span>`;
+      else if (isSold) detail = `<span class="activity-item__detail">Marketplace ID: <code>${escapeHtml(String(p.marketplaceListingId || "—"))}</code></span>`;
+      else if (isQ) detail = `<span class="activity-item__detail">${escapeHtml(String(p.question || ""))}</span>`;
+      else if (isPriceReq) {
+        const offered = p.offeredPriceCents ? money(Number(p.offeredPriceCents)) : "—";
+        const original = p.originalPriceCents ? money(Number(p.originalPriceCents)) : "—";
+        detail = `<span class="activity-item__detail">Offered ${offered} <span class="activity-item__original">(asking ${original})</span></span>`;
+      }
+
+      let actions = "";
+      if (isCmt || isQ) {
+        actions = `<span class="activity-item__actions">
+          <button class="act-btn act-btn--reply" data-lid="${attrEscape(l.listingId)}" data-type="${attrEscape(type)}">Reply</button>
+        </span>`;
+      } else if (isPriceReq) {
+        actions = `<span class="activity-item__actions">
+          <button class="act-btn act-btn--accept" data-lid="${attrEscape(l.listingId)}">Accept offer</button>
+          <button class="act-btn act-btn--decline" data-lid="${attrEscape(l.listingId)}">Decline</button>
+        </span>`;
+      }
+
       return `<li class="activity-item">
         <span class="activity-item__icon ${iconCls}">${icon}</span>
         <span class="activity-item__title">${title}</span>
         <span class="activity-item__time" title="${escapeHtml(a.createdAt)}">${relTime(a.createdAt)}</span>
         ${detail}
+        ${actions}
       </li>`;
     }).join("");
     actHtml = `<div class="listing-card__activity"><ol class="activity-list">${actHtml}</ol></div>`;
@@ -690,6 +727,77 @@ document.getElementById("replay-dlq-btn")?.addEventListener("click", async () =>
     if (r.replayed > 0) { await refreshListings(); document.getElementById("auto-refresh").checked = true; startPolling(); }
   } catch (e) { toast("DLQ replay failed", "err"); }
   finally { setTimeout(() => { btn.disabled = false; btn.textContent = "Replay DLQ"; }, 2000); }
+});
+
+// ── Inline reply / action forms ────────────────────────────────────────────
+
+function openInlineForm({ actionsEl, placeholder, sendLabel, cancelLabel = "Cancel", onSend }) {
+  if (actionsEl.querySelector(".inline-form")) return; // already open
+  const form = document.createElement("div");
+  form.className = "inline-form";
+  form.innerHTML = `
+    <textarea class="inline-form__input" rows="2" placeholder="${escapeHtml(placeholder)}"></textarea>
+    <div class="inline-form__btns">
+      <button class="act-btn act-btn--send">${escapeHtml(sendLabel)}</button>
+      <button class="act-btn inline-form__cancel">${escapeHtml(cancelLabel)}</button>
+    </div>`;
+  form.querySelector(".act-btn--send").addEventListener("click", () => {
+    const text = form.querySelector("textarea").value.trim();
+    if (!text) { form.querySelector("textarea").focus(); return; }
+    onSend(text);
+    form.remove();
+  });
+  form.querySelector(".inline-form__cancel").addEventListener("click", () => form.remove());
+  actionsEl.appendChild(form);
+  form.querySelector("textarea").focus();
+}
+
+document.getElementById("listings-root")?.addEventListener("click", (e) => {
+  const btn = e.target.closest(".act-btn");
+  if (!btn || btn.closest(".inline-form")) return;
+  e.stopPropagation();
+
+  const actionsEl = btn.closest(".activity-item__actions");
+
+  if (btn.classList.contains("act-btn--reply")) {
+    const isQ = btn.dataset.type === "new_question";
+    openInlineForm({
+      actionsEl,
+      placeholder: isQ ? "Answer the buyer's question…" : "Reply to the buyer…",
+      sendLabel: "Send reply",
+      onSend: (text) => {
+        toast(`✉️ Reply sent: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`, "ok", 4000);
+        btn.disabled = true;
+        btn.textContent = "Replied ✓";
+      },
+    });
+  } else if (btn.classList.contains("act-btn--accept")) {
+    openInlineForm({
+      actionsEl,
+      placeholder: "Optional message to buyer with your acceptance…",
+      sendLabel: "Confirm & accept offer",
+      onSend: (text) => {
+        toast(`✅ Offer accepted. Message sent: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`, "ok", 4500);
+        btn.disabled = true;
+        btn.textContent = "Accepted ✓";
+        const decline = actionsEl.querySelector(".act-btn--decline");
+        if (decline) { decline.disabled = true; }
+      },
+    });
+  } else if (btn.classList.contains("act-btn--decline")) {
+    openInlineForm({
+      actionsEl,
+      placeholder: "Optional message explaining why you're declining…",
+      sendLabel: "Decline offer",
+      onSend: (text) => {
+        toast(`❌ Offer declined. Message sent: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`, "info", 4000);
+        btn.disabled = true;
+        btn.textContent = "Declined ✓";
+        const accept = actionsEl.querySelector(".act-btn--accept");
+        if (accept) { accept.disabled = true; }
+      },
+    });
+  }
 });
 
 // ── Init ───────────────────────────────────────────────────────────────────

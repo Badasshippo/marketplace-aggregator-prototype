@@ -599,12 +599,19 @@ async function ingestWebhook(
     return jsonResponse(401, { error: "invalid_webhook", detail: v.reason });
   }
 
+  const ACCEPTED_EVENTS = ["item_sold", "new_comment", "new_question", "price_change_request"];
+
   let msg: {
     type?: string;
     listingId?: string;
     marketplaceListingId?: string;
     publishRequestId?: string;
     comment?: string;
+    question?: string;
+    buyerName?: string;
+    offeredPriceCents?: number;
+    originalPriceCents?: number;
+    buyerMessage?: string;
     eventId?: string;
   };
   try {
@@ -615,7 +622,7 @@ async function ingestWebhook(
 
   const type = msg.type;
   const listingId = msg.listingId;
-  if (!listingId || (type !== "item_sold" && type !== "new_comment")) {
+  if (!listingId || !type || !ACCEPTED_EVENTS.includes(type)) {
     return jsonResponse(400, { error: "invalid_event" });
   }
 
@@ -647,61 +654,58 @@ async function ingestWebhook(
     throw e;
   }
 
-  if (type === "item_sold") {
-    try {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: LISTINGS_TABLE,
-          Key: { listingId },
-          UpdateExpression:
-            "SET #s = :sold, marketplaceListingId = :m, updatedAt = :u",
-          ExpressionAttributeNames: { "#s": "status" },
-          ExpressionAttributeValues: {
-            ":sold": "sold",
-            ":live": "live",
-            ":publishing": "publishing",
-            ":m": msg.marketplaceListingId ?? "unknown",
-            ":u": createdAt,
-          },
-          ConditionExpression: "#s IN (:live, :publishing)",
-        })
-      );
-    } catch (e) {
-      if (!(e instanceof ConditionalCheckFailedException)) throw e;
+  // Transition listing state based on event type
+  const mktId = msg.marketplaceListingId ?? "unknown";
+  try {
+    if (type === "item_sold") {
+      // sold: terminal — only transition from live or publishing
+      await ddb.send(new UpdateCommand({
+        TableName: LISTINGS_TABLE,
+        Key: { listingId },
+        UpdateExpression: "SET #s = :sold, marketplaceListingId = :m, updatedAt = :u",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: {
+          ":sold": "sold", ":live": "live", ":publishing": "publishing",
+          ":pending": "pending_review", ":m": mktId, ":u": createdAt,
+        },
+        ConditionExpression: "#s IN (:live, :publishing, :pending)",
+      }));
+    } else if (type === "price_change_request") {
+      // pending_review: seller must act — transition live → pending_review
+      await ddb.send(new UpdateCommand({
+        TableName: LISTINGS_TABLE,
+        Key: { listingId },
+        UpdateExpression: "SET #s = :pending, marketplaceListingId = if_not_exists(marketplaceListingId, :m), updatedAt = :u",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: {
+          ":pending": "pending_review", ":live": "live", ":publishing": "publishing",
+          ":m": mktId, ":u": createdAt,
+        },
+        ConditionExpression: "#s IN (:live, :publishing)",
+      }));
+    } else {
+      // new_comment / new_question: mark listing live once marketplace confirms it
+      await ddb.send(new UpdateCommand({
+        TableName: LISTINGS_TABLE,
+        Key: { listingId },
+        UpdateExpression: "SET #s = :live, marketplaceListingId = if_not_exists(marketplaceListingId, :m), updatedAt = :u",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: {
+          ":live": "live", ":publishing": "publishing", ":m": mktId, ":u": createdAt,
+        },
+        ConditionExpression: "#s = :publishing",
+      }));
     }
-  } else {
-    try {
-      await ddb.send(
-        new UpdateCommand({
-          TableName: LISTINGS_TABLE,
-          Key: { listingId },
-          UpdateExpression:
-            "SET #s = :live, marketplaceListingId = if_not_exists(marketplaceListingId, :m), updatedAt = :u",
-          ExpressionAttributeNames: { "#s": "status" },
-          ExpressionAttributeValues: {
-            ":live": "live",
-            ":publishing": "publishing",
-            ":m": msg.marketplaceListingId ?? "unknown",
-            ":u": createdAt,
-          },
-          ConditionExpression: "#s = :publishing",
-        })
-      );
-    } catch (e) {
-      if (!(e instanceof ConditionalCheckFailedException)) throw e;
-      await ddb.send(
-        new UpdateCommand({
-          TableName: LISTINGS_TABLE,
-          Key: { listingId },
-          UpdateExpression:
-            "SET marketplaceListingId = if_not_exists(marketplaceListingId, :m), updatedAt = :u",
-          ExpressionAttributeValues: {
-            ":m": msg.marketplaceListingId ?? "unknown",
-            ":u": createdAt,
-          },
-        })
-      );
-    }
+  } catch (e) {
+    // ConditionalCheckFailed just means status was already past that state — safe to ignore
+    if (!(e instanceof ConditionalCheckFailedException)) throw e;
+    // Still update the marketplace listing id if somehow missed
+    await ddb.send(new UpdateCommand({
+      TableName: LISTINGS_TABLE,
+      Key: { listingId },
+      UpdateExpression: "SET marketplaceListingId = if_not_exists(marketplaceListingId, :m), updatedAt = :u",
+      ExpressionAttributeValues: { ":m": mktId, ":u": createdAt },
+    }));
   }
 
   return jsonResponse(200, { ok: true });
