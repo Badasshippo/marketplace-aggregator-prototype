@@ -1,0 +1,16 @@
+{
+  "name": "marketplace-aggregator-prototype",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Senior engineer assignment — marketplace aggregator prototype",
+  "scripts": {
+    "build": "npm run build --prefix frontend && npm run build --prefix infra",
+    "deploy": "npm install --prefix frontend && npm install --prefix infra && npm run build && npm run deploy --prefix infra",
+    "destroy": "npm run destroy --prefix infra",
+    "synth": "npm run synth --prefix infra",
+    "test:smoke": "node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

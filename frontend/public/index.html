@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="List once on a unified control plane. Mock eBay-style publish pipeline with signed webhooks and a live activity feed."
+    />
+    <meta name="theme-color" content="#0a0a0b" />
+    <title>OmniList — unified marketplace control</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <div class="page-bg" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <div>
+            <p class="brand__name">OmniList</p>
+            <p class="brand__tag">One listing. Mock marketplace. Real pipeline.</p>
+          </div>
+        </div>
+        <div class="topbar__meta" id="connection-pill" role="status">
+          <span class="pulse" aria-hidden="true"></span>
+          <span id="connection-label">Ready</span>
+        </div>
+      </div>
+    </header>
+
+    <main id="main" class="main">
+      <div class="main__grid">
+        <section class="panel panel--form" aria-labelledby="form-heading">
+          <div class="panel__head">
+            <h1 id="form-heading" class="panel__title">New listing</h1>
+            <p class="panel__lede">
+              Title, story, and price flow to a rate-limited async publisher. Webhooks
+              <code>new_comment</code> and <code>item_sold</code> land in your feed.
+            </p>
+          </div>
+          <form id="listing-form" class="form" novalidate>
+            <div class="field">
+              <label for="f-title">Title</label>
+              <input
+                id="f-title"
+                name="title"
+                type="text"
+                required
+                maxlength="200"
+                autocomplete="off"
+                placeholder="Leica M6 TTL · near mint"
+              />
+            </div>
+            <div class="field">
+              <label for="f-desc">Description</label>
+              <textarea
+                id="f-desc"
+                name="description"
+                required
+                rows="5"
+                maxlength="4000"
+                placeholder="Condition, inclusions, shipping policy…"
+              ></textarea>
+            </div>
+            <div class="field-row">
+              <div class="field field--price">
+                <label for="f-price">Price (USD)</label>
+                <input
+                  id="f-price"
+                  name="price"
+                  type="number"
+                  inputmode="decimal"
+                  step="0.01"
+                  min="0"
+                  required
+                  placeholder="0.00"
+                />
+              </div>
+              <div class="field field--image">
+                <label for="f-photo">Image URL <span class="optional">optional</span></label>
+                <input
+                  id="f-photo"
+                  name="photoUrl"
+                  type="url"
+                  inputmode="url"
+                  placeholder="https://…"
+                />
+              </div>
+            </div>
+            <div class="form__actions">
+              <button type="submit" class="btn btn--primary" id="submit-btn">
+                <span class="btn__shimmer" aria-hidden="true"></span>
+                <span>Publish to mock marketplace</span>
+              </button>
+              <p id="form-status" class="form__status" role="status" aria-live="polite"></p>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel panel--feed" aria-labelledby="feed-heading">
+          <div class="panel__head panel__head--row">
+            <div>
+              <h2 id="feed-heading" class="panel__title">Listings &amp; activity</h2>
+              <p class="panel__lede panel__lede--tight">
+                Live when anything is still moving through the pipeline. Idle when everything is
+                sold or failed.
+              </p>
+            </div>
+            <div class="feed-tools">
+              <label class="toggle" title="Refresh every 2s while listings are in flight">
+                <input type="checkbox" id="auto-refresh" checked />
+                <span>Live updates</span>
+              </label>
+              <button type="button" class="btn btn--ghost" id="refresh-btn">Refresh now</button>
+            </div>
+          </div>
+          <div id="listings-root" class="listings" aria-live="polite" aria-busy="false">
+            <div class="skeleton-grid" id="skeleton">
+              <div class="skeleton-card"></div>
+              <div class="skeleton-card"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
